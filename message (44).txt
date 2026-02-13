@@ -1,0 +1,2285 @@
+--[[
+    Plaza Bot - Trading Plaza Automation
+    Runs alongside kaitun.lua for sniping/listing in trading plaza
+    
+    Features:
+    - Event-based sniping (instant reaction to new listings)
+    - Auto-list secrets at configured prices
+    - Resell sniped items at markup
+    - Webhook notifications
+    - Backend coordination (server assignment, heartbeat)
+]]
+local Config = {
+    -- Performance Optimizations (reduce CPU/GPU/memory for 24/7 AFK)
+    Performance = {
+        Enabled = true,                -- Enable all optimizations
+        FPSCap = 10,                   -- Cap framerate (10-60; lower = less CPU)
+        Disable3DRendering = true,     -- Disable rendering (huge savings)
+        DisableTextures = true,        -- Clear mesh textures
+        DisableParticles = true,       -- Disable particles/trails/beams
+        DisableSounds = true,          -- Mute all sounds
+        DisableShadows = true,         -- Turn off shadows/lighting
+        PeriodicGC = true,             -- Run garbage collector every 60s
+
+        -- Aggressive memory optimizations
+        DestroyAccessories = true,     -- Remove character accessories (huge RAM savings)
+        ClearUnusedGUIs = true,        -- Destroy unused GUI elements
+        MinimalCharacter = true,       -- Keep only essential character parts (hitbox)
+        DestroyPetModels = true,       -- Remove 3D pet models from workspace (saves 100+ MB)
+        ClearSoundBuffers = true,      -- Clear sound content (saves 20-50 MB)
+    },
+
+    -- DO NOT CHANGE ABOVE THIS LINE --
+    ----------------------------------
+
+    -- Backend server for coordination
+    Backend = {
+        Enabled = true,  -- Enable when backend is ready
+        URL = "http://104.237.6.219:7823",
+        HeartbeatInterval = 30,
+    },
+
+    -- Site tracker ingest (tapsim-api): sends live players + booth listings per JobId
+    -- This powers "who is selling X right now" + join button gating (only show live owners).
+    Tracker = {
+        Enabled = true,               -- Set true to enable ingest
+        URL = "https://api.tapsim.gg", -- Base URL for tapsim-api (no trailing slash)
+        ApiKey = "77fb5eb2655f2d1c0d9064854ebe864e",
+        Interval = 10,                 -- seconds between snapshots
+        SendOnChange = false,           -- send quickly after PlayerListingsUpdated events
+        FullScanOnStart = true,        -- seed cache by scanning GetBoothListings for all players once
+        PeriodicRescanInterval = 15,   -- seconds between full rescans of all players (0 to disable)
+    },
+    
+    -- P2W threshold (bots with secrets or enough paid tokens can trade)
+    P2W = {
+        MinPaidTokens = 100,  -- Minimum paid tokens to be considered "P2W"
+        SkipEligibilityCheck = true,  -- Go to plaza regardless of secrets/tokens
+    },
+    
+    -- Wait for eligibility (run in normal server, auto-teleport when ready)
+    WaitForEligibility = {
+        Enabled = true,       -- If true, waits in normal server until eligible
+        CheckInterval = 30,   -- How often to check (seconds)
+    },
+    
+    -- Server hopping
+    ServerHop = {
+        Enabled = true,       -- Auto server-hop when conditions met
+        MinPlayers = 5,        -- Hop if server drops below this
+        CheckInterval = 60,    -- How often to check (seconds)
+        PreferHigherPop = true, -- Prefer servers with more players (more listings)
+    },
+    
+    -- Snipe settings (BUY)
+    Snipe = {
+        Enabled = true,
+        
+        -- Buy ANY secret under this price (tokens)
+        MaxPriceAnySecret = 10,
+        
+        -- Buy ANY leaderboard rarity pet under this price (tokens)
+        MaxPriceLeaderboard = 150,
+        
+        -- Never buy these pets (even if cheap)
+        Blacklist = {
+            "Serenity",
+            "Frost Queen",
+        },
+        
+        -- Specific buy prices (max we'll pay for each pet)
+        -- These override MaxPriceAnySecret/MaxPriceLeaderboard
+        -- Works for ANY variant (Normal, Golden, Rainbow, Void, etc.)
+        BuyPrices = {
+            -- High value secrets (will buy any variant at these prices)
+            ["40M Darkest Knight"] = 100,
+            ["5M Frost Monarch"] = 100,
+            
+            -- Specific pets to snipe
+            ["Nebula Cyborg"] = 200,
+            ["Celestial Candycane"] = 200,
+            ["2026 Star"] = 200,
+            
+            -- Other valuable pets
+            ["Krampus"] = 200,
+            ["Techno Dragon"] = 2000,
+            ["Overcharged Robot"] = 100,
+
+            ["Serephyn"] = 200,
+            ["Divine Celestia"] = 2000,
+            ["Reindeer Emperor"] = 2000
+        },
+    },
+    
+    -- Listing settings (SELL)
+    Listing = {
+        Enabled = true,
+        AutoListSecrets = true,  -- Auto-list our secrets at configured prices
+        
+        -- Sell prices for each pet
+        -- Format: ["PetName"] = price  OR  ["PetName_Tier"] = price for specific tiers
+        -- Example: ["Huge Hell Rock"] = 500  (sells Normal for 500)
+        -- Example: ["Huge Hell Rock_Golden"] = 1000  (sells Golden variant for 1000)
+        -- Example: ["Huge Hell Rock_Rainbow"] = 2000  (Rainbow variant)
+        -- Example: ["Huge Hell Rock_Void"] = 3000  (Void mutation)
+        SellPrices = {
+            -- Secret III
+            ["40M Darkest Knight"] = 1300,
+            
+            -- Secret II
+            ["40M Oblivion Shard"] = 450,
+            ["5M Frost Monarch"] = 1300,
+            
+            -- Secret I
+            ["40M Abyss Serpent"] = 150,
+            ["5M North Star"] = 200,
+            ["Frosty Snowman"] = 120,
+
+            -- Electric pets
+            ["Dual Shock"] = 150,
+            ["Overcharged Robot"] = 600,
+            ["Surge Dragon"] = 80,
+
+            ["2026 Balloons"] = 75
+        },
+        -- If no configured price: DO NOT AUTO-LIST (hold and send webhook)
+        -- We removed DefaultMarkup - only sell at explicit prices!
+    },
+    
+    -- Webhooks
+    Webhooks = {
+        Snipes = "https://discord.com/api/webhooks/1462622798877949995/0OzctLk6emZC7_kVPpaPf9iHD9rfpa11_y2_piFDd637dlpq06uxlEbnCZhthlnLOtDQ",
+        Sales = "https://discord.com/api/webhooks/1462622839931928626/AEjYMu-XUNqlzmCowI8DDw4cxNTpXCRxnzS5MDHqEYdivCKlHaEIlUi4XV_XwfQQ-r4p",
+        Listings = "https://discord.com/api/webhooks/1462622886626857121/6ICzJZ0Nh6Frb82GhgDwdTJha_o587eky9CHwHkOAmj6Vbct7KoSwypUQ3LrVfQ7VT4N",  -- When we list something
+        UnknownPrices = "https://discord.com/api/webhooks/1462623045179932733/ktjw2AbmjLS80Sj_DRrk00yz3OoaCSt4v6p5q4VDy-3b1BuUnCh2VwtSVxa82jHY0F0p",  -- When we snipe but don't know sell price
+        MissedSnipes = "https://discord.com/api/webhooks/1462622928075096105/IustTEbx8lHFzYVTJz4uSdPGOqTwr4nXlKYgILS6AM7mVDS21oaRXao5QWs5UKmf-p-z",  -- When we would've bought but couldn't afford
+        Errors = "https://discord.com/api/webhooks/1464488743502086226/0DgiSMoNLEr5vT5P_bY9Q8P6T8CUXQ0zPdWl_lgRZkq3lcpF-n7hagSUdypOxOaZY-EK",  -- Error notifications
+    },
+    
+    -- Logging
+    LogLevel = "INFO",  -- DEBUG, INFO, WARN, ERROR (set to DEBUG to diagnose booth issues)
+}
+
+----------------------------------------------------------------
+-- INTERNALS
+----------------------------------------------------------------
+
+local PlazaBot = {_VERSION = "1.0.0"}
+
+-- Services
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TeleportService = game:GetService("TeleportService")
+
+-- Modules
+local Network = require(ReplicatedStorage.Modules.Network)
+local Replication = require(ReplicatedStorage.Game.Replication)
+local PetStats = require(ReplicatedStorage.Game.PetStats)
+
+local LocalPlayer = Players.LocalPlayer
+
+-- Prevent multiple copies from running at once
+local _ENVROOT = (getgenv and getgenv()) or _G
+if _ENVROOT.__PLAZA_BOT_INSTANCE and _ENVROOT.__PLAZA_BOT_INSTANCE.Stop then
+    pcall(function()
+        _ENVROOT.__PLAZA_BOT_INSTANCE.Stop()
+    end)
+end
+
+-- State
+local _running = true
+local _inPlaza = false
+local _myBooth = nil
+local _costBasis = {}  -- petId -> tokens paid (for profit tracking)
+local _listedPets = {} -- petId -> listingId
+local _myListings = {} -- listingId -> {petName, tier, price, petId} (for tracking sales)
+
+-- Site tracker cache (sellerId -> raw listings table from PlayerListingsUpdated / GetBoothListings)
+local _trackerSellerListings = {}
+local _trackerSellerNames = {}
+local _trackerDirty = false
+local _trackerLastSend = 0
+
+-- SPEED: Cache rarity lookups (PetStats:GetRarity is slow)
+local _rarityCache = {}  -- petName -> rarity string
+local function getCachedRarity(petName)
+    if not petName then return nil end
+    if _rarityCache[petName] ~= nil then
+        return _rarityCache[petName]
+    end
+    local rarity = PetStats:GetRarity(petName)
+    _rarityCache[petName] = rarity or false  -- false = checked but not found
+    return rarity
+end
+
+local function isCachedSecret(petName)
+    local rarity = getCachedRarity(petName)
+    return rarity and tostring(rarity):find("Secret")
+end
+
+local function isCachedLeaderboard(petName)
+    local rarity = getCachedRarity(petName)
+    return rarity and tostring(rarity):find("Leaderboard")
+end
+
+-- Logging
+local LogLevels = {DEBUG = 4, INFO = 3, WARN = 2, ERROR = 1, NONE = 0}
+local function log(level, msg)
+    if LogLevels[level] <= LogLevels[Config.LogLevel] then
+        local prefix = {INFO = "[*]", WARN = "[!]", ERROR = "[X]", DEBUG = "[D]"}
+        print(("[PLAZA] %s %s"):format(prefix[level] or "[?]", tostring(msg)))
+
+        -- Send ERROR level logs to Discord
+        if level == "ERROR" and PlazaBot and PlazaBot.SendErrorWebhook then
+            pcall(function()
+                PlazaBot.SendErrorWebhook(msg)
+            end)
+        end
+    end
+end
+
+-- Safety helpers: NEVER let tracker / event callback errors impact other functionality.
+local function _formatErr(err)
+    err = tostring(err)
+    local ok, tb = pcall(function()
+        return (debug and debug.traceback) and debug.traceback(err, 2) or err
+    end)
+    return ok and tb or err
+end
+
+local function safeCall(ctx, fn, ...)
+    if type(fn) ~= "function" then
+        return false, ("[%s] safeCall got non-function: %s"):format(tostring(ctx), tostring(typeof(fn)))
+    end
+
+    local args = table.pack(...)
+    local out
+    local ok, err = xpcall(function()
+        out = table.pack(fn(table.unpack(args, 1, args.n)))
+    end, _formatErr)
+
+    if not ok then
+        log("ERROR", ("[SAFE] %s: %s"):format(tostring(ctx), tostring(err)))
+        return false, err
+    end
+
+    return true, table.unpack(out, 1, out.n)
+end
+
+local function safeConnect(signal, ctx, fn)
+    local ok, connOrErr = pcall(function()
+        return signal:Connect(function(...)
+            safeCall(ctx, fn, ...)
+        end)
+    end)
+
+    if not ok then
+        log("ERROR", ("[SAFE] Failed to connect %s: %s"):format(tostring(ctx), tostring(connOrErr)))
+        return nil
+    end
+
+    return connOrErr
+end
+
+----------------------------------------------------------------
+-- PERFORMANCE OPTIMIZATIONS
+----------------------------------------------------------------
+
+local function applyPerformanceOptimizations()
+    local cfg = Config.Performance
+    if not cfg or not cfg.Enabled then
+        log("INFO", "Performance: Optimizations disabled")
+        return
+    end
+
+    -- FPS cap (reduces CPU usage)
+    if cfg.FPSCap and tonumber(cfg.FPSCap) then
+        local fps = math.clamp(tonumber(cfg.FPSCap), 10, 240)
+        local success = pcall(function()
+            setfpscap(fps)
+        end)
+        if success then
+            log("INFO", ("Performance: FPS capped at %d"):format(fps))
+        end
+    end
+
+    -- 3D rendering
+    if cfg.Disable3DRendering then
+        pcall(function()
+            game:GetService("RunService"):Set3dRenderingEnabled(false)
+
+            local camera = workspace.CurrentCamera
+            if camera then
+                camera.CameraSubject = nil
+                for _, effect in ipairs(camera:GetChildren()) do
+                    if effect:IsA("PostEffect") then
+                        effect.Enabled = false
+                    end
+                end
+            end
+            log("INFO", "Performance: 3D rendering disabled")
+        end)
+    end
+
+    -- Workspace cleanup (textures, particles, etc.)
+    pcall(function()
+        for _, obj in ipairs(workspace:GetDescendants()) do
+            -- Particles
+            if cfg.DisableParticles and (obj:IsA("ParticleEmitter") or obj:IsA("Trail") or obj:IsA("Beam") or obj:IsA("Fire") or obj:IsA("Smoke") or obj:IsA("Sparkles")) then
+                obj.Enabled = false
+            -- Textures
+            elseif cfg.DisableTextures then
+                if obj:IsA("MeshPart") then
+                    obj.TextureID = ""
+                elseif obj:IsA("Decal") or obj:IsA("Texture") then
+                    obj.Transparency = 1
+                end
+            end
+            -- Shadows
+            if cfg.DisableShadows and obj:IsA("BasePart") then
+                obj.CastShadow = false
+                obj.Material = Enum.Material.SmoothPlastic
+            end
+            -- Lights
+            if cfg.DisableShadows and obj:IsA("Light") then
+                obj.Enabled = false
+            end
+            -- Sounds
+            if cfg.DisableSounds and obj:IsA("Sound") then
+                obj.Volume = 0
+            end
+        end
+        log("INFO", "Performance: Workspace optimized")
+    end)
+
+    -- Lighting
+    if cfg.DisableShadows then
+        pcall(function()
+            local lighting = game:GetService("Lighting")
+            lighting.GlobalShadows = false
+            lighting.FogEnd = 100
+            lighting.Brightness = 0
+            log("INFO", "Performance: Lighting disabled")
+        end)
+    end
+
+    -- Aggressive memory optimizations
+    if cfg.DestroyAccessories or cfg.MinimalCharacter then
+        pcall(function()
+            local char = LocalPlayer.Character
+            if char then
+                if cfg.DestroyAccessories then
+                    for _, obj in ipairs(char:GetDescendants()) do
+                        if obj:IsA("Accessory") or obj:IsA("Clothing") or obj:IsA("CharacterMesh") then
+                            obj:Destroy()
+                        end
+                    end
+                end
+
+                if cfg.MinimalCharacter then
+                    for _, part in ipairs(char:GetChildren()) do
+                        if part:IsA("BasePart") and part.Name ~= "HumanoidRootPart" and part.Name ~= "Head" then
+                            if part:IsA("MeshPart") then
+                                part.TextureID = ""
+                                part.MeshId = ""
+                            end
+                        end
+                    end
+                end
+            end
+            log("INFO", "Performance: Character optimized")
+        end)
+    end
+
+    -- Clear/destroy GUIs
+    pcall(function()
+        local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
+        if not playerGui then return end
+
+        if cfg.ClearUnusedGUIs then
+            for _, gui in ipairs(playerGui:GetChildren()) do
+                local name = gui.Name:lower()
+                if name:find("effect") or name:find("particle") or name:find("animation")
+                   or name:find("intro") or name:find("tutorial") or name:find("showcase") then
+                    gui:Destroy()
+                end
+            end
+            log("INFO", "Performance: Unused GUIs cleared")
+        end
+    end)
+
+    -- Destroy pet models in workspace
+    if cfg.DestroyPetModels then
+        pcall(function()
+            local destroyed = 0
+            for _, folder in ipairs(workspace:GetChildren()) do
+                local name = folder.Name
+                if name == "PetInstances" or name == "GoldPets" or name == "RainbowPets"
+                   or name == "DiamondPets" or name:find("Pets") then
+                    folder:ClearAllChildren()
+                    destroyed = destroyed + 1
+                end
+            end
+            if destroyed > 0 then
+                log("INFO", ("Performance: Cleared %d pet model folders"):format(destroyed))
+            end
+        end)
+    end
+
+    -- Clear sound buffers
+    if cfg.ClearSoundBuffers then
+        pcall(function()
+            for _, sound in ipairs(workspace:GetDescendants()) do
+                if sound:IsA("Sound") then
+                    sound.SoundId = ""
+                    sound.Volume = 0
+                end
+            end
+            log("INFO", "Performance: Sound buffers cleared")
+        end)
+    end
+
+    -- Periodic garbage collection + memory cleanup
+    if cfg.PeriodicGC then
+        task.spawn(function()
+            while _running do
+                task.wait(60)
+                pcall(function()
+                    if cfg.Disable3DRendering then
+                        game:GetService("RunService"):Set3dRenderingEnabled(false)
+                    end
+                end)
+                pcall(function()
+                    local before = gcinfo()
+                    collectgarbage("count")
+                    local after = gcinfo()
+                    if (before - after) > 1000 then
+                        log("DEBUG", ("GC: Freed %.1f MB"):format((before - after) / 1024))
+                    end
+                end)
+            end
+        end)
+    end
+
+    log("INFO", "Performance: All optimizations applied")
+end
+
+----------------------------------------------------------------
+-- HELPERS
+----------------------------------------------------------------
+
+-- Regular Tokens = worthless (only for gamepass purchases)
+-- PaidTokens = plaza currency (used for trading)
+local function getRegularTokens()
+    local data = Replication.Data
+    return (data and data.Items and data.Items.Tokens) or 0
+end
+
+local function getPaidTokens()
+    local data = Replication.Data
+    return (data and data.Items and data.Items.PaidTokens) or 0
+end
+
+-- For plaza trading, we ONLY use PaidTokens
+local function getTokens()
+    return getPaidTokens()
+end
+
+local function getPets()
+    local data = Replication.Data
+    return data and data.Pets or {}
+end
+
+local function isSecretPet(petName)
+    return isCachedSecret(petName)
+end
+
+local function isLeaderboardPet(petName)
+    return isCachedLeaderboard(petName)
+end
+
+local function hasSecretPet()
+    -- Check if we own any secret pet
+    local pets = getPets()
+    for _, pet in pairs(pets) do
+        if pet and pet.Name and isSecretPet(pet.Name) then
+            return true
+        end
+    end
+    return false
+end
+
+local function isP2WEligible()
+    -- Skip eligibility check if configured (go to plaza regardless)
+    if Config.P2W and Config.P2W.SkipEligibilityCheck then
+        return true, "eligibility check skipped (config)"
+    end
+
+    -- Check if bot has enough paid tokens to trade
+    local paidTokens = getPaidTokens()
+    local minTokens = Config.P2W and Config.P2W.MinPaidTokens or 100
+
+    if paidTokens >= minTokens then
+        return true, ("has %.0f paid tokens"):format(paidTokens)
+    end
+
+    -- Also eligible if has secret pet (can sell it)
+    if hasSecretPet() then
+        return true, "has secret pet to sell"
+    end
+
+    return false, ("only %.0f paid tokens (need %d)"):format(paidTokens, minTokens)
+end
+
+-- Convert blacklist to Set for O(1) lookup (built on first use)
+local _blacklistSet = nil
+local function isBlacklisted(petName)
+    if not _blacklistSet then
+        _blacklistSet = {}
+        for _, name in ipairs(Config.Snipe.Blacklist) do
+            _blacklistSet[name] = true
+        end
+    end
+    return _blacklistSet[petName] == true
+end
+
+local function getMaxBuyPrice(petName, tier, mutation)
+    local prices = Config.Snipe.BuyPrices
+    
+    -- Priority: Name_Mutation > Name_Tier > Name (same as sell prices)
+    
+    -- Try mutation-specific (e.g. "Nebula Cyborg_Void")
+    if mutation and mutation ~= "" then
+        local mutKey = petName .. "_" .. mutation
+        if prices[mutKey] then
+            return prices[mutKey]
+        end
+    end
+    
+    -- Try tier-specific (e.g. "Nebula Cyborg_Rainbow", "Nebula Cyborg_Golden")
+    if tier and tier ~= "" and tier ~= "Normal" then
+        local tierKey = petName .. "_" .. tier
+        if prices[tierKey] then
+            return prices[tierKey]
+        end
+    end
+    
+    -- Try base name (e.g. "Nebula Cyborg")
+    if prices[petName] then
+        return prices[petName]
+    end
+    
+    -- If it's a secret, use MaxPriceAnySecret
+    if isSecretPet(petName) then
+        return Config.Snipe.MaxPriceAnySecret or 0
+    end
+    
+    -- If it's a leaderboard pet, use MaxPriceLeaderboard
+    if isLeaderboardPet(petName) then
+        return Config.Snipe.MaxPriceLeaderboard or 0
+    end
+    
+    -- Not interested in non-secrets/non-leaderboard without specific prices
+    return 0
+end
+
+local function getSellPrice(petName, tier, mutation)
+    -- Try tier/mutation-specific prices first
+    -- Priority: Name_Mutation > Name_Tier > Name (for Normal only)
+    -- NON-NORMAL variants REQUIRE explicit prices (won't fall back to base)
+    
+    local prices = Config.Listing.SellPrices
+    
+    -- Try mutation-specific (e.g. "Huge Hell Rock_Void")
+    if mutation and mutation ~= "" then
+        local mutKey = petName .. "_" .. mutation
+        if prices[mutKey] then
+            return prices[mutKey]
+        end
+        -- Mutation set but no price = HOLD (don't undersell)
+        return nil
+    end
+    
+    -- Try tier-specific (e.g. "Huge Hell Rock_Golden", "Huge Hell Rock_Rainbow")
+    if tier and tier ~= "" and tier ~= "Normal" then
+        local tierKey = petName .. "_" .. tier
+        if prices[tierKey] then
+            return prices[tierKey]
+        end
+        -- Non-Normal tier without explicit price = HOLD (don't undersell Rainbow/Golden for Normal price)
+        return nil
+    end
+    
+    -- Normal tier - can use base name price
+    if prices[petName] then
+        return prices[petName]
+    end
+    
+    -- NO DEFAULT MARKUP - only sell at configured prices
+    -- Return nil to indicate "hold this pet, don't list"
+    return nil
+end
+
+----------------------------------------------------------------
+-- HTTP HELPERS
+----------------------------------------------------------------
+
+local function httpRequest(url, method, body, extraHeaders)
+    local env = (getgenv and getgenv()) or _G
+    local req = (env and env.request) or
+                (env and env.http_request) or
+                (env and env.http and env.http.request) or
+                (env and env.syn and env.syn.request) or
+                (_G and _G.request) or
+                (_G and _G.http_request) or
+                (syn and syn.request)
+    
+    if not req then
+        return nil, "No HTTP function available (executor doesn't support requests)"
+    end
+    
+    local http = game:GetService("HttpService")
+    
+    local ok, response = pcall(function()
+        local headers = nil
+        if extraHeaders and type(extraHeaders) == "table" then
+            headers = {}
+            for k, v in pairs(extraHeaders) do
+                headers[k] = v
+            end
+        end
+        if body then
+            headers = headers or {}
+            headers["Content-Type"] = "application/json"
+        end
+        return req({
+            Url = url,
+            Method = method or "GET",
+            Headers = headers,
+            Body = body and http:JSONEncode(body) or nil,
+        })
+    end)
+    
+    if not ok then
+        return nil, "Request failed: " .. tostring(response)
+    end
+    
+    if not response then
+        return nil, "No response received"
+    end
+    
+    if response.StatusCode and response.StatusCode ~= 200 then
+        return nil, "HTTP " .. tostring(response.StatusCode)
+    end
+    
+    if response and response.Body then
+        local decodeOk, data = pcall(function()
+            return http:JSONDecode(response.Body)
+        end)
+        if decodeOk then
+            return data, nil
+        end
+        return response.Body, nil
+    end
+    
+    return nil, "Request failed"
+end
+
+local function sendWebhook(url, payload)
+    if not url or url == "" or url:find("YOUR_") then
+        return false
+    end
+    
+    task.spawn(function()
+        pcall(function()
+            httpRequest(url, "POST", payload)
+        end)
+    end)
+    return true
+end
+
+----------------------------------------------------------------
+-- WEBHOOKS
+----------------------------------------------------------------
+
+function PlazaBot.SendSnipeWebhook(petName, tier, pricePaid, sellerId, sellerName)
+    local marketValue = Config.Listing.SellPrices[petName] or "?"
+    local profit = type(marketValue) == "number" and (marketValue - pricePaid) or "?"
+    
+    local embed = {
+        title = "🎯 SNIPED!",
+        color = 0x00FF00,
+        fields = {
+            {name = "Pet", value = petName, inline = true},
+            {name = "Tier", value = tier or "Normal", inline = true},
+            {name = "Price Paid", value = tostring(pricePaid) .. " tokens", inline = true},
+            {name = "Market Value", value = tostring(marketValue) .. " tokens", inline = true},
+            {name = "Profit", value = "+" .. tostring(profit) .. " tokens", inline = true},
+            {name = "Seller", value = sellerName or tostring(sellerId), inline = true},
+            {name = "Bot", value = LocalPlayer.Name, inline = true},
+        },
+        footer = {text = "Plaza Bot v" .. PlazaBot._VERSION},
+        timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ"),
+    }
+    
+    sendWebhook(Config.Webhooks.Snipes, {embeds = {embed}})
+end
+
+function PlazaBot.SendSaleWebhook(petName, salePrice, costBasis, buyerName)
+    local profit = costBasis and (salePrice - costBasis) or salePrice
+    
+    local embed = {
+        title = "💰 SOLD!",
+        color = 0xFFD700,
+        fields = {
+            {name = "Pet", value = petName, inline = true},
+            {name = "Sale Price", value = tostring(salePrice) .. " tokens", inline = true},
+            {name = "Cost Basis", value = costBasis and (tostring(costBasis) .. " tokens") or "N/A", inline = true},
+            {name = "Profit", value = "+" .. tostring(profit) .. " tokens", inline = true},
+            {name = "Buyer", value = buyerName or "Unknown", inline = true},
+            {name = "Bot", value = LocalPlayer.Name, inline = true},
+        },
+        footer = {text = "Plaza Bot v" .. PlazaBot._VERSION},
+        timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ"),
+    }
+    
+    sendWebhook(Config.Webhooks.Sales, {embeds = {embed}})
+end
+
+function PlazaBot.SendListingWebhook(petName, tier, mutation, price, costBasis)
+    local profit = costBasis and (price - costBasis) or nil
+    local profitStr = profit and ("+" .. tostring(profit) .. " tokens (if sold)") or "N/A"
+    
+    -- Build variant string
+    local variant = tier or "Normal"
+    if mutation and mutation ~= "" then
+        variant = variant .. " " .. mutation
+    end
+    
+    local embed = {
+        title = "📋 LISTED!",
+        color = 0x5865F2,  -- Discord blurple
+        fields = {
+            {name = "Pet", value = petName, inline = true},
+            {name = "Variant", value = variant, inline = true},
+            {name = "List Price", value = tostring(price) .. " tokens", inline = true},
+            {name = "Cost Basis", value = costBasis and (tostring(costBasis) .. " tokens") or "N/A", inline = true},
+            {name = "Expected Profit", value = profitStr, inline = true},
+            {name = "Bot", value = LocalPlayer.Name, inline = true},
+        },
+        footer = {text = "Plaza Bot v" .. PlazaBot._VERSION},
+        timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ"),
+    }
+    
+    sendWebhook(Config.Webhooks.Listings, {embeds = {embed}})
+end
+
+function PlazaBot.SendUnknownPriceWebhook(petName, tier, pricePaid)
+    local embed = {
+        title = "❓ Unknown Price",
+        color = 0xFF9900,
+        description = "Sniped a pet with no configured sell price",
+        fields = {
+            {name = "Pet", value = petName, inline = true},
+            {name = "Tier", value = tier or "Normal", inline = true},
+            {name = "Price Paid", value = tostring(pricePaid) .. " tokens", inline = true},
+            {name = "Bot", value = LocalPlayer.Name, inline = true},
+        },
+        footer = {text = "Plaza Bot v" .. PlazaBot._VERSION .. " | Set a price in Config.Listing.SellPrices"},
+        timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ"),
+    }
+    
+    sendWebhook(Config.Webhooks.UnknownPrices, {embeds = {embed}})
+end
+
+function PlazaBot.SendMissedSnipeWebhook(petName, tier, price, tokensHave, sellerName)
+    local embed = {
+        title = "💸 MISSED SNIPE (Couldn't Afford)",
+        color = 0xFF0000,  -- Red
+        description = "Would've bought but didn't have enough tokens!",
+        fields = {
+            {name = "Pet", value = petName, inline = true},
+            {name = "Tier", value = tier or "Normal", inline = true},
+            {name = "Price", value = tostring(price) .. " tokens", inline = true},
+            {name = "We Have", value = tostring(math.floor(tokensHave)) .. " tokens", inline = true},
+            {name = "Short By", value = tostring(math.ceil(price - tokensHave)) .. " tokens", inline = true},
+            {name = "Seller", value = sellerName or "Unknown", inline = true},
+            {name = "Bot", value = LocalPlayer.Name, inline = true},
+        },
+        footer = {text = "Plaza Bot v" .. PlazaBot._VERSION .. " | Need more paid tokens!"},
+        timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ"),
+    }
+
+    sendWebhook(Config.Webhooks.MissedSnipes, {embeds = {embed}})
+end
+
+function PlazaBot.SendErrorWebhook(errorMsg)
+    local embed = {
+        title = "❌ Plaza Bot Error",
+        color = 0xFF0000,  -- Red
+        description = "```" .. tostring(errorMsg) .. "```",
+        fields = {
+            {name = "Bot", value = LocalPlayer.Name, inline = true},
+            {name = "JobId", value = game.JobId:sub(1, 16) .. "...", inline = true},
+            {name = "PlaceId", value = tostring(game.PlaceId), inline = true},
+        },
+        footer = {text = "Plaza Bot v" .. PlazaBot._VERSION},
+        timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ"),
+    }
+
+    sendWebhook(Config.Webhooks.Errors, {embeds = {embed}})
+end
+
+----------------------------------------------------------------
+-- SERVER MANAGEMENT (Auto-join, Server hopping)
+----------------------------------------------------------------
+
+-- Plaza configuration
+local NORMAL_PLAZA_PLACE_ID = 95383978784657    -- No requirements
+local SECRET_PLAZA_PLACE_ID = 124342049154699   -- Requires 3+ secret pets
+local PLAZA_PLACE_ID = NORMAL_PLAZA_PLACE_ID    -- Default (for compatibility)
+
+-- Count how many secret pets we own
+local function countSecretPets()
+    local count = 0
+    local pets = getPets()
+    for _, pet in pairs(pets) do
+        if pet and pet.Name and isSecretPet(pet.Name) then
+            count = count + 1
+        end
+    end
+    return count
+end
+
+-- Check if we're in any plaza
+local function isInAnyPlaza()
+    return game.PlaceId == NORMAL_PLAZA_PLACE_ID or game.PlaceId == SECRET_PLAZA_PLACE_ID
+end
+
+function PlazaBot.GetServerFromBackend()
+    -- Ask backend for best server to join
+    -- Returns jobId, placeId if assigned, nil if all servers are assigned (stay in current server)
+    if not Config.Backend.Enabled then return nil end
+
+    -- Send our secret count so backend can assign us to the right plaza type
+    local secretCount = countSecretPets()
+    local url = Config.Backend.URL .. "/api/assign-server?username=" .. LocalPlayer.Name .. "&secretCount=" .. tostring(secretCount)
+
+    local data, err = httpRequest(url, "GET", nil)
+    if data then
+        -- Backend returns jobId + placeId if there's an assignment, or message="all_servers_assigned" if none
+        if data.jobId then
+            local placeId = data.placeId or NORMAL_PLAZA_PLACE_ID
+            local plazaType = data.plazaType or "normal"
+            log("INFO", ("Backend assigned %s plaza (placeId: %s)"):format(plazaType, tostring(placeId)))
+            return data.jobId, placeId, data.plazaType
+        elseif data.message == "all_servers_assigned" then
+            -- All servers filled - stay in current server
+            return nil, "all_servers_assigned"
+        end
+    end
+    return nil, err or "no_response"
+end
+
+function PlazaBot.TeleportToServer(jobId, placeId)
+    -- Teleport to a specific server by JobId
+    placeId = placeId or NORMAL_PLAZA_PLACE_ID
+    local plazaName = placeId == SECRET_PLAZA_PLACE_ID and "SECRET" or "NORMAL"
+    log("INFO", ("Teleporting to %s plaza server: %s"):format(plazaName, jobId:sub(1, 12) .. "..."))
+
+    local success, err = pcall(function()
+        TeleportService:TeleportToPlaceInstance(placeId, jobId, LocalPlayer)
+    end)
+
+    if not success then
+        log("ERROR", ("Teleport failed: %s"):format(tostring(err)))
+        return false
+    end
+    return true
+end
+
+function PlazaBot.GetCurrentPlayerCount()
+    return #Players:GetPlayers()
+end
+
+function PlazaBot.ShouldServerHop()
+    if not Config.ServerHop or not Config.ServerHop.Enabled then
+        return false, "disabled"
+    end
+
+    -- Check if autotrade is busy (assigned, joining, or trading)
+    local env = getgenv and getgenv() or _G
+    if env.AutoTradeBusy then
+        return false, ("autotrade busy: %s"):format(tostring(env.AutoTradeBusyReason or "active"))
+    end
+
+    local playerCount = PlazaBot.GetCurrentPlayerCount()
+    local minPlayers = Config.ServerHop.MinPlayers or 3
+
+    if playerCount < minPlayers then
+        return true, ("only %d players (min: %d)"):format(playerCount, minPlayers)
+    end
+
+    return false, "server is fine"
+end
+
+function PlazaBot.ServerHopLoop()
+    if not Config.ServerHop or not Config.ServerHop.Enabled then return end
+    if not Config.Backend.Enabled then
+        log("WARN", "ServerHop requires Backend.Enabled = true")
+        return
+    end
+
+    local interval = Config.ServerHop.CheckInterval or 60
+
+    while _running do
+        task.wait(interval)
+
+        local shouldHop, reason = PlazaBot.ShouldServerHop()
+        if shouldHop then
+            log("INFO", ("Server hop triggered: %s"):format(reason))
+
+            local jobId, placeIdOrMsg, plazaType = PlazaBot.GetServerFromBackend()
+            if jobId and jobId ~= game.JobId then
+                PlazaBot.TeleportToServer(jobId, placeIdOrMsg)
+            else
+                if placeIdOrMsg == "all_servers_assigned" then
+                    log("DEBUG", "All servers assigned, staying in current server")
+                else
+                    log("WARN", "No better server available")
+                end
+            end
+        end
+    end
+end
+
+function PlazaBot.AutoJoinPlaza()
+    -- Check if we should auto-join plaza (have secret or paid tokens)
+    local eligible, reason = isP2WEligible()
+
+    if not eligible then
+        log("WARN", ("Not eligible for trading: %s"):format(reason))
+        return false
+    end
+
+    local secretCount = countSecretPets()
+    log("INFO", ("Eligible for trading: %s (secrets: %d)"):format(reason, secretCount))
+
+    -- If not in plaza, get a server and teleport
+    if not isInAnyPlaza() then
+        log("INFO", "Not in trading plaza, requesting server...")
+
+        if Config.Backend.Enabled then
+            local jobId, placeIdOrMsg, plazaType = PlazaBot.GetServerFromBackend()
+            if jobId then
+                return PlazaBot.TeleportToServer(jobId, placeIdOrMsg)
+            elseif placeIdOrMsg == "all_servers_assigned" then
+                log("DEBUG", "All servers assigned, staying in current server")
+                return false
+            else
+                log("WARN", "Backend didn't return a server - waiting for backend assignment (no fallback)")
+                return false
+            end
+        else
+            log("WARN", "Backend disabled - cannot teleport to plaza without backend assignment")
+            return false
+        end
+    end
+
+    return true
+end
+
+----------------------------------------------------------------
+-- BOOTH MANAGEMENT
+----------------------------------------------------------------
+
+-- Helper to get booths folder (supports both plaza types)
+local function getBoothsFolder()
+    log("DEBUG", "getBoothsFolder: checking for booths folder...")
+
+    -- Secret Plaza: workspace.SecretPlaza contains booth models directly
+    local secretPlaza = workspace:FindFirstChild("SecretPlaza")
+    if secretPlaza then
+        local childCount = #secretPlaza:GetChildren()
+        log("DEBUG", ("getBoothsFolder: found SecretPlaza with %d children"):format(childCount))
+        return secretPlaza, "secret"
+    end
+    log("DEBUG", "getBoothsFolder: SecretPlaza not found")
+
+    -- Normal Plaza: workspace.Game.Booths
+    local gameFolder = workspace:FindFirstChild("Game")
+    if gameFolder then
+        log("DEBUG", "getBoothsFolder: found workspace.Game")
+        local booths = gameFolder:FindFirstChild("Booths")
+        if booths then
+            local childCount = #booths:GetChildren()
+            log("DEBUG", ("getBoothsFolder: found Game.Booths with %d children"):format(childCount))
+            return booths, "normal"
+        else
+            log("DEBUG", "getBoothsFolder: Game.Booths not found")
+        end
+    else
+        log("DEBUG", "getBoothsFolder: workspace.Game not found")
+    end
+
+    log("WARN", "getBoothsFolder: NO booths folder found!")
+    return nil, nil
+end
+
+function PlazaBot.FindUnclaimedBooth()
+    -- Find an unclaimed booth in the plaza
+    log("DEBUG", "FindUnclaimedBooth: searching...")
+    local boothsFolder, plazaType = getBoothsFolder()
+    if not boothsFolder then
+        log("WARN", "FindUnclaimedBooth: Could not find booths folder (tried SecretPlaza and Game.Booths)")
+        return nil
+    end
+
+    log("DEBUG", ("FindUnclaimedBooth: checking booths in %s plaza"):format(plazaType or "unknown"))
+    local checkedCount = 0
+    local claimedCount = 0
+    local skippedCount = 0
+
+    for _, booth in ipairs(boothsFolder:GetChildren()) do
+        -- Only consider actual booths (named "Booth" or containing "Booth")
+        -- Skip other children like decoration models
+        if not booth.Name:lower():find("booth") then
+            skippedCount = skippedCount + 1
+            log("DEBUG", ("FindUnclaimedBooth: skipping non-booth '%s' (ClassName=%s)"):format(booth.Name, booth.ClassName))
+            continue
+        end
+
+        checkedCount = checkedCount + 1
+        local owner = booth:GetAttribute("BoothOwner")
+        local ownerName = booth:GetAttribute("BoothOwnerUsername")
+
+        if not owner or owner == 0 then
+            log("DEBUG", ("FindUnclaimedBooth: found unclaimed booth '%s' (checked %d booths)"):format(booth.Name, checkedCount))
+            return booth
+        else
+            claimedCount = claimedCount + 1
+            log("DEBUG", ("FindUnclaimedBooth: booth '%s' owned by %s (%s)"):format(booth.Name, tostring(owner), tostring(ownerName or "?")))
+        end
+    end
+
+    log("WARN", ("FindUnclaimedBooth: all %d booths claimed (checked %d, skipped %d non-booths)"):format(claimedCount, checkedCount, skippedCount))
+    return nil
+end
+
+function PlazaBot.FindMyBooth()
+    -- Check if we already own a booth
+    log("DEBUG", "FindMyBooth: checking if we already own a booth...")
+    local boothsFolder, plazaType = getBoothsFolder()
+    if not boothsFolder then
+        log("DEBUG", "FindMyBooth: no booths folder, returning nil")
+        return nil
+    end
+
+    local myUserId = LocalPlayer.UserId
+    log("DEBUG", ("FindMyBooth: looking for our UserId %s in %s plaza"):format(tostring(myUserId), plazaType or "unknown"))
+
+    for _, booth in ipairs(boothsFolder:GetChildren()) do
+        -- Only consider actual booths (named "Booth" or containing "Booth")
+        if not booth.Name:lower():find("booth") then
+            continue
+        end
+
+        local owner = booth:GetAttribute("BoothOwner")
+        if owner == myUserId then
+            log("DEBUG", ("FindMyBooth: found our booth '%s'"):format(booth.Name))
+            return booth
+        end
+    end
+
+    log("DEBUG", "FindMyBooth: we don't own any booth")
+    return nil
+end
+
+function PlazaBot.TeleportToBooth(booth)
+    -- Teleport near the booth
+    log("DEBUG", ("TeleportToBooth: starting teleport to booth '%s'"):format(booth and booth.Name or "nil"))
+
+    if not booth then
+        log("ERROR", "TeleportToBooth: booth is nil!")
+        return false
+    end
+
+    log("DEBUG", ("TeleportToBooth: booth ClassName='%s', Name='%s'"):format(booth.ClassName, booth.Name))
+
+    local char = LocalPlayer.Character
+    if not char then
+        log("ERROR", "TeleportToBooth: LocalPlayer.Character is nil!")
+        return false
+    end
+
+    if not char.PrimaryPart then
+        log("ERROR", "TeleportToBooth: Character.PrimaryPart is nil!")
+        -- Try waiting for character to load
+        log("DEBUG", "TeleportToBooth: waiting for HumanoidRootPart...")
+        local hrp = char:WaitForChild("HumanoidRootPart", 5)
+        if not hrp then
+            log("ERROR", "TeleportToBooth: HumanoidRootPart not found after 5s!")
+            return false
+        end
+        log("DEBUG", "TeleportToBooth: HumanoidRootPart found, retrying...")
+    end
+
+    log("DEBUG", ("TeleportToBooth: character ready, PrimaryPart='%s'"):format(char.PrimaryPart and char.PrimaryPart.Name or "nil"))
+
+    -- Get booth position (handle both Models and BaseParts)
+    local pos
+    if booth:IsA("BasePart") then
+        pos = booth.Position
+        log("DEBUG", ("TeleportToBooth: booth is BasePart, pos=%s"):format(tostring(pos)))
+    elseif booth:IsA("Model") then
+        log("DEBUG", "TeleportToBooth: booth is Model, finding position...")
+        -- Try PrimaryPart first, then search descendants for any BasePart
+        local part = booth.PrimaryPart
+        if part then
+            log("DEBUG", ("TeleportToBooth: using PrimaryPart '%s'"):format(part.Name))
+            pos = part.Position
+        else
+            log("DEBUG", "TeleportToBooth: no PrimaryPart, searching for BasePart recursively...")
+            part = booth:FindFirstChildWhichIsA("BasePart", true)
+            if part then
+                log("DEBUG", ("TeleportToBooth: found BasePart '%s'"):format(part.Name))
+                pos = part.Position
+            else
+                -- Fallback: use Model's pivot (GetPivot returns CFrame)
+                log("DEBUG", "TeleportToBooth: no BasePart found, using GetPivot()")
+                local pivot = booth:GetPivot()
+                pos = pivot.Position
+                log("DEBUG", ("TeleportToBooth: pivot position=%s"):format(tostring(pos)))
+            end
+        end
+    else
+        log("ERROR", ("TeleportToBooth: unknown booth type '%s'"):format(booth.ClassName))
+        return false
+    end
+
+    if not pos then
+        log("ERROR", "TeleportToBooth: could not determine position!")
+        return false
+    end
+
+    -- Teleport slightly in front of the booth
+    local targetPos = pos + Vector3.new(0, 3, 5)
+    log("INFO", ("TeleportToBooth: teleporting to %s"):format(tostring(targetPos)))
+
+    local success, err = pcall(function()
+        char:PivotTo(CFrame.new(targetPos))
+    end)
+
+    if not success then
+        log("ERROR", ("TeleportToBooth: PivotTo failed: %s"):format(tostring(err)))
+        return false
+    end
+
+    log("INFO", "TeleportToBooth: teleport successful!")
+    return true
+end
+
+function PlazaBot.ClaimBooth()
+    log("INFO", "ClaimBooth: starting booth claim process...")
+
+    -- Check if we already have a booth
+    _myBooth = PlazaBot.FindMyBooth()
+    if _myBooth then
+        log("INFO", ("ClaimBooth: already have booth '%s' claimed!"):format(_myBooth.Name))
+        return true
+    end
+
+    -- Find an unclaimed booth
+    log("INFO", "ClaimBooth: looking for unclaimed booth...")
+    local booth = PlazaBot.FindUnclaimedBooth()
+    if not booth then
+        log("WARN", "ClaimBooth: No unclaimed booths available!")
+        return false
+    end
+
+    log("INFO", ("ClaimBooth: found unclaimed booth '%s', teleporting..."):format(booth.Name))
+
+    -- Teleport to the booth
+    local teleportSuccess = PlazaBot.TeleportToBooth(booth)
+    if not teleportSuccess then
+        log("ERROR", "ClaimBooth: TeleportToBooth returned false!")
+        -- Continue anyway - maybe we're already close enough
+    end
+
+    log("DEBUG", "ClaimBooth: waiting 0.5s after teleport...")
+    task.wait(0.5)
+
+    -- Claim it
+    log("INFO", ("ClaimBooth: invoking ClaimBooth server for '%s'..."):format(booth.Name))
+    local success, result = pcall(function()
+        return Network:InvokeServer("ClaimBooth", booth)
+    end)
+
+    log("DEBUG", ("ClaimBooth: InvokeServer returned success=%s, result=%s"):format(tostring(success), tostring(result)))
+
+    if success then
+        _myBooth = booth
+        log("INFO", ("✅ ClaimBooth: Booth '%s' claimed successfully!"):format(booth.Name))
+        return true
+    else
+        log("ERROR", ("ClaimBooth: Failed to claim booth: %s"):format(tostring(result)))
+        return false
+    end
+end
+
+----------------------------------------------------------------
+-- SCANNING / DEBUG
+----------------------------------------------------------------
+
+function PlazaBot.ScanAllListings()
+    -- Scan all booths in the server and return listings
+    local allListings = {}
+    
+    -- Get all players in server
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer then
+            local success, listings = pcall(function()
+                return Network:InvokeServer("GetBoothListings", player.UserId)
+            end)
+            
+            if success and listings and type(listings) == "table" then
+                for listingId, listing in pairs(listings) do
+                    if type(listing) == "table" then
+                        listing._sellerId = player.UserId
+                        listing._sellerName = player.Name
+                        listing._listingId = listingId
+                        table.insert(allListings, listing)
+                    end
+                end
+            end
+        end
+    end
+    
+    return allListings
+end
+
+function PlazaBot.PrintSecretListings()
+    log("INFO", "Scanning all booths for secrets...")
+    
+    local listings = PlazaBot.ScanAllListings()
+    local secrets = {}
+    local allPets = {}
+    
+    for _, listing in ipairs(listings) do
+        if type(listing) ~= "table" then
+            continue
+        end
+
+        -- Get pet name from petData table (not petName which is the UUID)
+        local petData = listing.petData
+        local petName = nil
+        local petTier = nil
+        
+        if type(petData) == "table" then
+            petName = petData.Name
+            petTier = petData.Tier or "Normal"
+        end
+        
+        if petName then
+            local rarity = getCachedRarity(petName)
+            local rarityStr = rarity and tostring(rarity) or "?"
+            local isSecret = rarity and tostring(rarity):find("Secret")
+            
+            local entry = {
+                name = petName,
+                tier = petTier,
+                price = listing.itemPrice or 0,
+                seller = listing._sellerName,
+                listingId = listing._listingId,
+                sellerId = listing._sellerId,
+                rarity = rarityStr,
+                isSecret = isSecret ~= nil,
+            }
+            
+            table.insert(allPets, entry)
+            
+            if isSecret then
+                table.insert(secrets, entry)
+            end
+        end
+    end
+    
+    -- Sort all pets by price (cheapest first)
+    table.sort(allPets, function(a, b) return a.price < b.price end)
+    table.sort(secrets, function(a, b) return a.price < b.price end)
+    
+    -- Print ALL listings
+    print("=" .. string.rep("=", 80))
+    print("| ALL LISTINGS (" .. #allPets .. " total) - Sorted by Price")
+    print("=" .. string.rep("=", 80))
+    
+    for i, p in ipairs(allPets) do
+        local tierStr = p.tier ~= "Normal" and (" [" .. p.tier .. "]") or ""
+        local secretTag = p.isSecret and " ⭐SECRET" or ""
+        print(("| %3d. %s%s - %d tokens (%s)%s"):format(
+            i, p.name, tierStr, p.price, p.seller, secretTag
+        ))
+    end
+    
+    print("=" .. string.rep("=", 80))
+    
+    -- Print SECRETS only
+    if #secrets > 0 then
+        print("")
+        print("⭐" .. string.rep("=", 78) .. "⭐")
+        print("| SECRETS ONLY (" .. #secrets .. " found)")
+        print("⭐" .. string.rep("=", 78) .. "⭐")
+        
+        for i, s in ipairs(secrets) do
+            local tierStr = s.tier ~= "Normal" and (" [" .. s.tier .. "]") or ""
+            print(("| %d. %s%s - %d tokens (seller: %s)"):format(
+                i, s.name, tierStr, s.price, s.seller
+            ))
+        end
+        
+        print("⭐" .. string.rep("=", 78) .. "⭐")
+    else
+        print("| No secrets found in this server!")
+    end
+    
+    -- Sort by price (cheapest first)
+    table.sort(secrets, function(a, b) return a.price < b.price end)
+    
+    log("INFO", ("Found %d secrets listed:"):format(#secrets))
+    print("=" .. string.rep("=", 60))
+    print("| SECRETS FOR SALE (Cheapest → Expensive)")
+    print("=" .. string.rep("=", 60))
+    
+    if #secrets == 0 then
+        print("| No secrets found!")
+    else
+        for i, s in ipairs(secrets) do
+            local tierStr = s.tier ~= "Normal" and (" [" .. s.tier .. "]") or ""
+            print(("| %d. %s%s - %d tokens (seller: %s)"):format(
+                i, s.name, tierStr, s.price, s.seller
+            ))
+        end
+    end
+    
+    print("=" .. string.rep("=", 60))
+    
+    return secrets
+end
+
+----------------------------------------------------------------
+-- CORE TRADING FUNCTIONS
+----------------------------------------------------------------
+
+function PlazaBot.TryBuyItem(sellerId, listingId, listing)
+    if type(listing) ~= "table" then
+        return false
+    end
+
+    -- Get pet name from petData (not petName which is UUID)
+    local petData = listing.petData
+    local petName = nil
+    local tier = "Normal"
+    local mutation = nil
+    
+    if type(petData) == "table" then
+        petName = petData.Name
+        tier = petData.Tier or "Normal"
+        mutation = petData.Mutation
+    end
+    
+    if not petName then
+        log("DEBUG", "Listing has no petData.Name, skipping")
+        return false
+    end
+    
+    local price = listing.itemPrice
+    if type(price) ~= "number" then
+        return false
+    end
+    
+    -- Validate we want this (pass tier & mutation for variant-specific prices)
+    local maxPrice = getMaxBuyPrice(petName, tier, mutation)
+    if maxPrice <= 0 then
+        log("DEBUG", ("Skipping %s - not interested"):format(petName))
+        return false
+    end
+    
+    if price > maxPrice then
+        log("DEBUG", ("Skipping %s at %d tokens (max: %d)"):format(petName, price, maxPrice))
+        return false
+    end
+    
+    if isBlacklisted(petName) then
+        log("DEBUG", ("Skipping %s - blacklisted"):format(petName))
+        return false
+    end
+    
+    -- Check we have tokens
+    local tokensHave = getTokens()
+    if tokensHave < price then
+        log("WARN", ("Can't afford %s at %d tokens (have: %d) - MISSED SNIPE!"):format(petName, price, tokensHave))
+        
+        -- Get seller name for webhook
+        local sellerName = nil
+        pcall(function()
+            local player = Players:GetPlayerByUserId(sellerId)
+            sellerName = player and player.Name
+        end)
+        
+        -- Send missed snipe webhook
+        PlazaBot.SendMissedSnipeWebhook(petName, tier, price, tokensHave, sellerName)
+        return false
+    end
+    
+    -- SNIPE IT!
+    log("INFO", ("🎯 SNIPING: %s for %d tokens!"):format(petName, price))
+    
+    local success, err = pcall(function()
+        return Network:InvokeServer("BuyItem", sellerId, listingId)
+    end)
+    
+    if success then
+        log("INFO", ("✅ SNIPED: %s for %d tokens"):format(petName, price))
+        
+        -- Track cost basis for reselling
+        -- Note: We need to find the pet ID after purchase
+        -- For now, store by name (may need refinement for dupes)
+        _costBasis[petName] = _costBasis[petName] or {}
+        table.insert(_costBasis[petName], price)
+        
+        -- Get seller name
+        local sellerName = nil
+        pcall(function()
+            local player = Players:GetPlayerByUserId(sellerId)
+            sellerName = player and player.Name
+        end)
+        
+        -- Send webhook
+        PlazaBot.SendSnipeWebhook(petName, tier, price, sellerId, sellerName)
+        
+        -- Check if we have a sell price (pass tier for variant pricing)
+        local sellPrice = getSellPrice(petName, tier, nil)  -- mutation unknown from listing
+        if not sellPrice then
+            PlazaBot.SendUnknownPriceWebhook(petName, tier, price)
+        end
+        
+        return true
+    else
+        log("ERROR", ("Failed to snipe %s: %s"):format(petName, tostring(err)))
+        return false
+    end
+end
+
+function PlazaBot.GetPetDisplayName(petId)
+    -- Get pet's display name from our inventory
+    local pets = getPets()
+    local pet = pets[petId]
+    if pet and pet.Name then
+        return pet.Name, pet.Tier or "Normal"
+    end
+    return nil, nil
+end
+
+function PlazaBot.ListPet(petId, petName, tier, price, costBasis, mutation)
+    log("INFO", ("Listing %s for %d tokens"):format(petName, price))
+    
+    local success, err = pcall(function()
+        return Network:InvokeServer("ListItem", "Pet", petId, price)
+    end)
+    
+    if success then
+        log("INFO", ("✅ Listed: %s for %d tokens"):format(petName, price))
+        _listedPets[petId] = true
+        
+        -- Track for sale detection (we'll match by petName since listingId comes from server)
+        -- Store in a way we can match when PlayerListingsUpdated fires
+        _myListings[petId] = {
+            petName = petName,
+            tier = tier or "Normal",
+            mutation = mutation,
+            price = price,
+            petId = petId,
+            costBasis = costBasis,
+            listedAt = os.clock(),
+        }
+        
+        -- Send listing webhook
+        PlazaBot.SendListingWebhook(petName, tier, mutation, price, costBasis)
+        
+        return true
+    else
+        log("ERROR", ("Failed to list %s: %s"):format(petName, tostring(err)))
+        return false
+    end
+end
+
+function PlazaBot.RemoveListing(listingId)
+    local success, err = pcall(function()
+        return Network:InvokeServer("RemoveListing", listingId)
+    end)
+    return success
+end
+
+----------------------------------------------------------------
+-- EVENT HANDLERS (SPEED CRITICAL)
+----------------------------------------------------------------
+
+-- Handle OUR OWN listings changing (detect sales)
+function PlazaBot.OnMyListingsUpdated(listings)
+    -- Feed tracker cache with our own listings too
+    if Config.Tracker and Config.Tracker.Enabled then
+        _trackerSellerListings[LocalPlayer.UserId] = listings or {}
+        _trackerSellerNames[LocalPlayer.UserId] = LocalPlayer.Name
+        _trackerDirty = true
+    end
+
+    -- Build set of current listing petIds from server
+    local currentListings = {}
+    if type(listings) == "table" then
+        for listingId, listing in pairs(listings) do
+            if type(listing) ~= "table" then
+                continue
+            end
+
+            local petData = listing.petData
+            if type(petData) == "table" then
+                -- itemName is the petId (UUID)
+                local petId = listing.itemName
+                if petId then
+                    currentListings[petId] = {
+                        listingId = listingId,
+                        petName = petData.Name,
+                        tier = petData.Tier,
+                        price = listing.itemPrice,
+                    }
+                end
+            end
+        end
+    end
+    
+    -- Check what's missing from our tracked listings (= SOLD!)
+    for petId, tracked in pairs(_myListings) do
+        if not currentListings[petId] then
+            -- This listing is gone! Either sold or removed by us
+            local petName = tracked.petName
+            local price = tracked.price
+            local costBasis = tracked.costBasis
+            local profit = costBasis and (price - costBasis) or price
+            
+            log("INFO", ("💰 SOLD: %s for %d tokens (profit: +%d)"):format(petName, price, profit))
+            
+            -- Send webhook
+            PlazaBot.SendSaleWebhook(petName, price, costBasis, "Unknown Buyer")
+            
+            -- Remove from our tracking
+            _myListings[petId] = nil
+            _listedPets[petId] = nil
+        end
+    end
+    
+    -- Update our tracking with current server state
+    for petId, data in pairs(currentListings) do
+        if _myListings[petId] then
+            -- Update listingId if we have it tracked
+            _myListings[petId].listingId = data.listingId
+        end
+    end
+end
+
+-- FAST snipe check - inline everything for speed
+function PlazaBot.OnListingsUpdated(sellerId, listings)
+    -- Handle our OWN listings separately (for sale detection)
+    if sellerId == LocalPlayer.UserId then
+        PlazaBot.OnMyListingsUpdated(listings)
+        return
+    end
+    
+    -- Get seller name
+    local sellerName = "?"
+    pcall(function()
+        local player = Players:GetPlayerByUserId(sellerId)
+        if player then sellerName = player.Name end
+    end)
+
+    -- Update tracker cache (so the site can query live booths)
+    if Config.Tracker and Config.Tracker.Enabled then
+        _trackerSellerListings[sellerId] = listings or {}
+        _trackerSellerNames[sellerId] = sellerName
+        _trackerDirty = true
+    end
+    
+    -- Count and list what changed
+    local count = 0
+    local petNames = {}
+    if type(listings) == "table" then
+        for listingId, listing in pairs(listings) do
+            count = count + 1
+            if type(listing) ~= "table" then
+                continue
+            end
+
+            local petData = listing.petData
+            if type(petData) == "table" and petData.Name then
+                local tierStr = petData.Tier and petData.Tier ~= "Normal" and (" [" .. petData.Tier .. "]") or ""
+                table.insert(petNames, petData.Name .. tierStr .. " @ " .. tostring(listing.itemPrice))
+            end
+        end
+    end
+    
+    -- Print the update
+    if count > 0 then
+        print(("[LISTINGS] %s updated (%d items): %s"):format(sellerName, count, table.concat(petNames, ", ")))
+    else
+        print(("[LISTINGS] %s cleared their booth"):format(sellerName))
+    end
+    
+    if not Config.Snipe.Enabled then return end
+    if type(listings) ~= "table" then return end
+    
+    -- Process ALL listings immediately (no task.spawn delay for first check)
+    for listingId, listing in pairs(listings) do
+        if type(listing) ~= "table" then
+            continue
+        end
+
+        local petData = listing.petData
+        if type(petData) ~= "table" then continue end
+        
+        local petName = petData.Name
+        if not petName then continue end
+        
+        local price = listing.itemPrice or 999999
+        
+        -- FAST PATH: Check specific buy prices first (O(1) lookup)
+        local maxPrice = Config.Snipe.BuyPrices[petName]
+        
+        -- If no specific price, check if it's a secret under max price
+        if not maxPrice then
+            if price <= Config.Snipe.MaxPriceAnySecret and isCachedSecret(petName) then
+                maxPrice = Config.Snipe.MaxPriceAnySecret
+            end
+        end
+        
+        -- Not interested or too expensive
+        if not maxPrice or price > maxPrice then continue end
+        
+        -- Check blacklist (O(1) lookup)
+        if isBlacklisted(petName) then continue end
+        
+        -- Check tokens
+        if getTokens() < price then continue end
+        
+        -- 🎯 SNIPE IT! (spawn to not block other listings)
+        task.spawn(function()
+            local tier = petData.Tier or "Normal"
+            local mutation = petData.Mutation
+            log("INFO", ("🎯 SNIPING: %s [%s] for %d tokens!"):format(petName, tier, price))
+
+            -- Send snapshot IMMEDIATELY before purchase (for snipe notifications)
+            if Config.Tracker and Config.Tracker.Enabled then
+                local success, err = pcall(function()
+                    local snapshotPayload = {
+                        jobId = game.JobId,
+                        placeId = game.PlaceId,
+                        merge = true,  -- Append this listing instead of replacing all listings
+                        listings = {
+                            {
+                                petName = petName,
+                                tier = tier,
+                                mutation = mutation or nil,
+                                enchant = petData.Enchant or nil,
+                                price = price,
+                                ownerUserId = sellerId,
+                                ownerName = sellerName,
+                            }
+                        },
+                    }
+
+                    local url = Config.Tracker.URL .. "/api/tapsim/plaza/snapshot"
+                    local data, httpErr = httpRequest(url, "POST", snapshotPayload, {
+                        ["x-api-key"] = Config.Tracker.ApiKey,
+                    })
+
+                    if httpErr then
+                        log("ERROR", ("Pre-purchase snapshot failed: %s"):format(tostring(httpErr)))
+                    else
+                        log("DEBUG", ("Sent pre-purchase snapshot for %s"):format(petName))
+                    end
+                end)
+
+                if not success then
+                    log("ERROR", ("Pre-purchase snapshot error: %s"):format(tostring(err)))
+                end
+            end
+
+            local success = pcall(function()
+                return Network:InvokeServer("BuyItem", sellerId, listingId)
+            end)
+            
+            if success then
+                log("INFO", ("✅ SNIPED: %s for %d tokens"):format(petName, price))
+                
+                -- Track cost basis
+                _costBasis[petName] = _costBasis[petName] or {}
+                table.insert(_costBasis[petName], price)
+                
+                -- Get seller name
+                local sellerName = nil
+                pcall(function()
+                    local player = Players:GetPlayerByUserId(sellerId)
+                    sellerName = player and player.Name
+                end)
+                
+                -- Send webhook
+                PlazaBot.SendSnipeWebhook(petName, tier, price, sellerId, sellerName)
+                
+                -- Check if we need sell price (pass tier for variant pricing)
+                if not getSellPrice(petName, tier, nil) then
+                    PlazaBot.SendUnknownPriceWebhook(petName, tier, price)
+                end
+            end
+        end)
+    end
+end
+
+----------------------------------------------------------------
+-- LOOPS
+----------------------------------------------------------------
+
+----------------------------------------------------------------
+-- TRACKER (site ingest)
+----------------------------------------------------------------
+
+function PlazaBot.BuildTrackerPayload()
+    local playersOut = {}
+    for _, plr in ipairs(Players:GetPlayers()) do
+        table.insert(playersOut, { userId = plr.UserId, name = plr.Name })
+    end
+
+    local listingsOut = {}
+    for sellerId, listings in pairs(_trackerSellerListings) do
+        local ownerName = _trackerSellerNames[sellerId] or "?"
+        pcall(function()
+            local p = Players:GetPlayerByUserId(sellerId)
+            if p then ownerName = p.Name end
+        end)
+
+        if type(listings) == "table" then
+            for _, listing in pairs(listings) do
+                local petData = listing and listing.petData
+                if type(petData) == "table" and petData.Name then
+                    -- Pass through enchant string value (or nil if no enchant)
+                    local enchant = petData.Enchant or nil
+
+                    table.insert(listingsOut, {
+                        petName = petData.Name,
+                        tier = petData.Tier or "Normal",
+                        mutation = petData.Mutation or nil,
+                        enchant = enchant,
+                        price = listing.itemPrice or 0,
+                        ownerUserId = sellerId,
+                        ownerName = ownerName,
+                        boothId = nil,
+                    })
+                end
+            end
+        end
+    end
+
+    return {
+        jobId = game.JobId,
+        placeId = game.PlaceId,
+        players = playersOut,
+        listings = listingsOut,
+    }
+end
+
+function PlazaBot.SendTrackerSnapshot()
+    -- Hard safety wrapper: this function must NEVER throw.
+    local ok, retOk, retValOrErr = safeCall("SendTrackerSnapshot", function()
+        if not (Config.Tracker and Config.Tracker.Enabled) then
+            return false, "tracker_disabled"
+        end
+        if not Config.Tracker.URL or Config.Tracker.URL == "" then
+            return false, "missing_tracker_url"
+        end
+        if not Config.Tracker.ApiKey or Config.Tracker.ApiKey == "" or tostring(Config.Tracker.ApiKey):find("SET_TAPSIM_TRACKER_KEY") then
+            return false, "missing_tracker_key"
+        end
+        if type(httpRequest) ~= "function" then
+            return false, "httpRequest_missing"
+        end
+
+        local url = Config.Tracker.URL .. "/api/tapsim/plaza/snapshot"
+
+        local payloadOk, payloadOrErr = safeCall("BuildTrackerPayload", PlazaBot.BuildTrackerPayload)
+        if not payloadOk then
+            return false, payloadOrErr
+        end
+
+        local result, httpErr = httpRequest(url, "POST", payloadOrErr, {
+            ["x-api-key"] = Config.Tracker.ApiKey,
+        })
+
+        if httpErr then
+            return false, httpErr
+        end
+        return true, result
+    end)
+
+    if not ok then
+        return false, retOk
+    end
+    return retOk, retValOrErr
+end
+
+-- Helper: Full rescan of all players' booth listings
+local function rescanAllPlayerListings()
+    local scanned = 0
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if not _running then return scanned end
+        local ok, listings = pcall(function()
+            return Network:InvokeServer("GetBoothListings", plr.UserId)
+        end)
+        if ok and type(listings) == "table" then
+            _trackerSellerListings[plr.UserId] = listings
+            _trackerSellerNames[plr.UserId] = plr.Name
+            scanned = scanned + 1
+        end
+        task.wait(0.15)  -- Slight delay to avoid hammering server
+    end
+    _trackerDirty = true
+    return scanned
+end
+
+function PlazaBot.TrackerLoop()
+    if not (Config.Tracker and Config.Tracker.Enabled) then
+        return
+    end
+
+    local interval = tonumber(Config.Tracker.Interval) or 10
+    interval = math.max(3, interval)
+    local minChangeInterval = 2
+    local rescanInterval = tonumber(Config.Tracker.PeriodicRescanInterval) or 30
+    local lastRescan = os.clock()  -- Start timer from now (seed scan will reset if enabled)
+
+    log("INFO", ("TrackerLoop started (interval=%ss, rescan=%ss)"):format(tostring(interval), tostring(rescanInterval)))
+
+    -- Seed cache so we don't rely only on future update events
+    if Config.Tracker.FullScanOnStart then
+        task.spawn(function()
+            safeCall("TrackerSeedScan", function()
+                log("INFO", "Tracker: seeding listings cache (GetBoothListings for all players)...")
+                local count = rescanAllPlayerListings()
+                lastRescan = os.clock()
+                log("INFO", ("Tracker: seed scan complete (%d players)"):format(count))
+            end)
+        end)
+    end
+
+    safeConnect(Players.PlayerRemoving, "Tracker.PlayerRemoving", function(plr)
+        if not plr then return end
+        _trackerSellerListings[plr.UserId] = nil
+        _trackerSellerNames[plr.UserId] = nil
+        _trackerDirty = true
+    end)
+
+    safeConnect(Players.PlayerAdded, "Tracker.PlayerAdded", function(plr)
+        if not plr then return end
+        _trackerSellerNames[plr.UserId] = plr.Name
+        if Config.Tracker.FullScanOnStart then
+            task.spawn(function()
+                safeCall("Tracker.PlayerAdded.ScanBooth", function()
+                    task.wait(2)
+                    if not _running then return end
+                    local ok, listings = pcall(function()
+                        return Network:InvokeServer("GetBoothListings", plr.UserId)
+                    end)
+                    if ok and type(listings) == "table" then
+                        _trackerSellerListings[plr.UserId] = listings
+                        _trackerDirty = true
+                    end
+                end)
+            end)
+        end
+    end)
+
+    while _running do
+        safeCall("TrackerLoop.Tick", function()
+            local now = os.clock()
+
+            -- Periodic rescan of all players' listings (catch missed events)
+            if rescanInterval > 0 and (now - lastRescan) >= rescanInterval then
+                local count = rescanAllPlayerListings()
+                lastRescan = now
+                log("DEBUG", ("Tracker: periodic rescan complete (%d players)"):format(count))
+            end
+
+            local duePeriodic = (now - _trackerLastSend) >= interval
+            local dueChange = Config.Tracker.SendOnChange and _trackerDirty and (now - _trackerLastSend) >= minChangeInterval
+
+            if duePeriodic or dueChange then
+                local ok, resultOrErr = PlazaBot.SendTrackerSnapshot()
+                if ok then
+                    _trackerLastSend = now
+                    _trackerDirty = false
+                    log("DEBUG", "Tracker snapshot OK")
+                else
+                    log("WARN", ("Tracker snapshot failed: %s"):format(tostring(resultOrErr)))
+                    _trackerLastSend = now
+                end
+            end
+        end)
+
+        task.wait(1)
+    end
+end
+
+function PlazaBot.ListingLoop()
+    -- Auto-list our secrets at configured prices
+    while _running do
+        if Config.Listing.Enabled and Config.Listing.AutoListSecrets then
+            local pets = getPets()
+            
+            for petId, pet in pairs(pets) do
+                -- NOTE: We intentionally do NOT skip equipped pets (you asked to allow listing even if equipped).
+                if pet and pet.Name and not pet.Locked then
+                    -- Check if it's a secret we want to list
+                    if isSecretPet(pet.Name) then
+                        local tier = pet.Tier or "Normal"
+                        local mutation = pet.Mutation
+                        local sellPrice = getSellPrice(pet.Name, tier, mutation)
+
+                        -- Check if already listed at a different price
+                        local existingListing = _myListings[petId]
+                        if existingListing and sellPrice and existingListing.price ~= sellPrice then
+                            -- Price changed - remove and relist
+                            log("INFO", ("Price change detected for %s: %d -> %d, relisting..."):format(
+                                pet.Name, existingListing.price, sellPrice))
+
+                            if existingListing.listingId then
+                                PlazaBot.RemoveListing(existingListing.listingId)
+                                _listedPets[petId] = nil
+                                _myListings[petId] = nil
+                                task.wait(0.5)
+                            end
+                        end
+
+                        -- List if not already listed
+                        if not _listedPets[petId] and sellPrice then
+                            local costBasisList = _costBasis[pet.Name]
+                            local cost = costBasisList and costBasisList[1]  -- FIFO
+                            PlazaBot.ListPet(petId, pet.Name, tier, sellPrice, cost, mutation)
+
+                            -- Remove cost basis entry (FIFO)
+                            if costBasisList and #costBasisList > 0 then
+                                table.remove(costBasisList, 1)
+                            end
+
+                            task.wait(1)  -- Don't spam listings
+                        elseif not sellPrice and not _listedPets["held_" .. petId] then
+                            -- No configured price - HOLD and notify (don't list with default markup)
+                            -- Only send webhook once per pet (track by petId)
+                            _listedPets["held_" .. petId] = true
+                            log("WARN", ("No sell price for %s %s - holding"):format(tier, pet.Name))
+                            PlazaBot.SendUnknownPriceWebhook(pet.Name, tier, 0)
+                        end
+                    end
+                end
+            end
+        end
+        
+        task.wait(10)  -- Check every 10 seconds
+    end
+end
+
+function PlazaBot.HeartbeatLoop()
+    if not Config.Backend.Enabled then
+        log("WARN", "HeartbeatLoop: Backend disabled")
+        return
+    end
+
+    log("INFO", "HeartbeatLoop started")
+
+    while _running do
+        local ok, err = pcall(function()
+            local jobId = game.JobId
+            local url = Config.Backend.URL .. "/api/heartbeat"
+            local secretCount = countSecretPets()
+            local payload = {
+                jobId = jobId,
+                username = LocalPlayer.Name,
+                paidTokens = getPaidTokens(),
+                hasSecret = hasSecretPet(),
+                secretCount = secretCount,
+                placeId = game.PlaceId,
+            }
+
+            log("DEBUG", ("Sending heartbeat (secrets: %d, placeId: %s)..."):format(secretCount, tostring(game.PlaceId)))
+            local result, httpErr = httpRequest(url, "POST", payload)
+
+            if httpErr then
+                log("WARN", ("Heartbeat HTTP error: %s"):format(tostring(httpErr)))
+            elseif result then
+                log("DEBUG", ("Heartbeat sent OK: %s"):format(tostring(result.ok or result)))
+
+                -- Check if backend wants us to switch servers (redistribution)
+                if result.shouldSwitch and result.targetJobId then
+                    -- Don't switch if autotrade is busy
+                    local env = getgenv and getgenv() or _G
+                    if env.AutoTradeBusy then
+                        log("DEBUG", ("Skipping redistribute - autotrade busy: %s"):format(tostring(env.AutoTradeBusyReason or "active")))
+                    else
+                        log("INFO", ("🔄 REDISTRIBUTE: Backend says switch to %s"):format(tostring(result.targetJobId):sub(1, 12) .. "..."))
+
+                        -- Teleport to the new server
+                        local targetPlaceId = result.targetPlaceId or game.PlaceId
+                        local teleportOk, teleportErr = pcall(function()
+                            TeleportService:TeleportToPlaceInstance(targetPlaceId, result.targetJobId, LocalPlayer)
+                        end)
+
+                        if not teleportOk then
+                            log("ERROR", ("Redistribute teleport failed: %s"):format(tostring(teleportErr)))
+                        end
+                    end
+                end
+            else
+                log("WARN", "Heartbeat: No response")
+            end
+        end)
+
+        if not ok then
+            log("ERROR", ("HeartbeatLoop error: %s"):format(tostring(err)))
+        end
+
+        task.wait(Config.Backend.HeartbeatInterval)
+    end
+end
+
+----------------------------------------------------------------
+-- WAIT FOR ELIGIBILITY (runs in normal server until ready)
+----------------------------------------------------------------
+
+function PlazaBot.WaitForEligibilityLoop()
+    local interval = (Config.WaitForEligibility and Config.WaitForEligibility.CheckInterval) or 30
+    local TeleportService = game:GetService("TeleportService")
+
+    log("INFO", ("Checking eligibility every %ds..."):format(interval))
+
+    while _running do
+        -- Check eligibility (respects SkipEligibilityCheck config)
+        local eligible, reason = isP2WEligible()
+
+        if eligible then
+            -- Don't teleport if autotrade is busy
+            local env = getgenv and getgenv() or _G
+            if env.AutoTradeBusy then
+                log("DEBUG", ("Eligible but autotrade busy, waiting... (%s)"):format(tostring(env.AutoTradeBusyReason or "active")))
+                task.wait(interval)
+                continue
+            end
+
+            log("INFO", ("✅ Now eligible for plaza! (%s)"):format(reason))
+            
+            -- Query backend for best plaza server (dual-plaza support)
+            local serverJobId = nil
+            local targetPlaceId = nil
+            local secretCount = countSecretPets()
+
+            if Config.Backend.Enabled then
+                pcall(function()
+                    local response = httpRequest(Config.Backend.URL .. "/api/assign-server", "POST", {
+                        username = LocalPlayer.Name,
+                        paidTokens = paidTokens,
+                        hasSecret = hasSecret,
+                        secretCount = secretCount,
+                    })
+                    if response then
+                        serverJobId = response.jobId
+                        targetPlaceId = response.placeId
+                        if serverJobId then
+                            log("INFO", ("Backend assigned server: %s (placeId: %s)"):format(
+                                tostring(serverJobId), tostring(targetPlaceId)))
+                        end
+                    end
+                end)
+            end
+
+            -- Determine target plaza based on secret count if backend didn't provide
+            if not targetPlaceId then
+                if secretCount >= 3 then
+                    targetPlaceId = SECRET_PLAZA_PLACE_ID
+                else
+                    targetPlaceId = NORMAL_PLAZA_PLACE_ID
+                end
+            end
+
+            -- Only teleport if backend gave us a specific server (no fallback rawdog teleport)
+            if serverJobId and serverJobId ~= "" then
+                log("INFO", ("Teleporting to Trading Plaza (placeId: %s, jobId: %s, secrets: %d)..."):format(
+                    tostring(targetPlaceId), serverJobId:sub(1, 12) .. "...", secretCount))
+                pcall(function()
+                    TeleportService:TeleportToPlaceInstance(targetPlaceId, serverJobId)
+                end)
+
+                -- Wait for teleport (or timeout)
+                task.wait(10)
+                log("WARN", "Teleport may have failed, retrying next cycle...")
+            else
+                log("INFO", "Eligible but no server assigned by backend yet, waiting...")
+            end
+        else
+            log("DEBUG", ("Not eligible yet: %s"):format(reason))
+        end
+
+        task.wait(interval)
+    end
+end
+
+----------------------------------------------------------------
+-- MAIN
+----------------------------------------------------------------
+
+function PlazaBot.Init()
+    log("INFO", "Plaza Bot v" .. PlazaBot._VERSION)
+    log("INFO", "Player: " .. LocalPlayer.Name)
+    
+    -- Wait for replication
+    while not Replication.Loaded do
+        task.wait(0.1)
+    end
+    
+    log("INFO", ("Paid Tokens: %.2f (this is what we use for trading)"):format(getPaidTokens()))
+    log("INFO", ("Regular Tokens: %.2f (worthless, only for gamepasses)"):format(getRegularTokens()))
+    
+    -- Bind to PlayerListingsUpdated event (instant snipe reactions)
+    pcall(function()
+        Network:BindEvents({
+            ["PlayerListingsUpdated"] = function(sellerId, listings)
+                -- Never let event callback errors break the bind/event processing.
+                safeCall("Event.PlayerListingsUpdated", PlazaBot.OnListingsUpdated, sellerId, listings)
+            end
+        })
+        log("INFO", "✅ Bound to PlayerListingsUpdated event")
+    end)
+    
+    -- Check if we're in trading plaza by PlaceId
+    _inPlaza = isInAnyPlaza()
+
+    if _inPlaza then
+        local plazaName = game.PlaceId == SECRET_PLAZA_PLACE_ID and "SECRET" or "NORMAL"
+        log("INFO", ("In %s trading plaza! (PlaceId: %s)"):format(plazaName, tostring(game.PlaceId)))
+    else
+        log("INFO", ("Not in plaza (PlaceId: %s)"):format(tostring(game.PlaceId)))
+
+        -- If WaitForEligibility is enabled, wait here until we're ready
+        if Config.WaitForEligibility and Config.WaitForEligibility.Enabled then
+            log("INFO", "Waiting for eligibility (secret or paid tokens)...")
+            PlazaBot.WaitForEligibilityLoop()
+            return  -- WaitForEligibilityLoop handles teleport, then script restarts in plaza
+        else
+            log("WARN", "Not in plaza and WaitForEligibility disabled. Exiting.")
+            return
+        end
+    end
+    
+    -- PRIORITY: Claim booth FIRST (before cache warming) for fastest sniping
+    log("INFO", "Claiming booth...")
+    if Config.Listing.Enabled then
+        PlazaBot.ClaimBooth()
+    end
+    
+    -- Pre-warm rarity cache in background (non-blocking)
+    task.spawn(function()
+        log("INFO", "Pre-warming rarity cache (background)...")
+        local cacheCount = 0
+        for petName, _ in pairs(PetStats.Pets or {}) do
+            getCachedRarity(petName)
+            cacheCount = cacheCount + 1
+        end
+        log("INFO", ("Cached %d pet rarities"):format(cacheCount))
+    end)
+    
+    -- Sync our current listings (if we have any already)
+    log("INFO", "Syncing our booth listings...")
+    pcall(function()
+        local myListings = Network:InvokeServer("GetBoothListings", LocalPlayer.UserId)
+        if myListings and type(myListings) == "table" then
+            local count = 0
+            for listingId, listing in pairs(myListings) do
+                if type(listing) ~= "table" then
+                    continue
+                end
+
+                local petData = listing.petData
+                if type(petData) == "table" then
+                    local petId = listing.itemName
+                    if petId then
+                        _myListings[petId] = {
+                            petName = petData.Name,
+                            tier = petData.Tier or "Normal",
+                            price = listing.itemPrice,
+                            petId = petId,
+                            listingId = listingId,
+                            listedAt = os.clock(),
+                        }
+                        _listedPets[petId] = true
+                        count = count + 1
+                    end
+                end
+            end
+            log("INFO", ("Found %d existing listings"):format(count))
+        end
+    end)
+    
+    -- Scan and print secrets on startup (this is slow but just for display)
+    log("INFO", "Scanning booths (slow, just for display)...")
+    PlazaBot.PrintSecretListings()
+    
+    log("INFO", "Ready! Listening for listings...")
+end
+
+function PlazaBot.Run()
+    PlazaBot.Init()
+    
+    -- Start loops
+    task.spawn(PlazaBot.ListingLoop)
+    task.spawn(PlazaBot.HeartbeatLoop)
+    task.spawn(PlazaBot.ServerHopLoop)
+    task.spawn(PlazaBot.TrackerLoop)
+    
+    -- Status loop
+    while _running do
+        task.wait(60)
+        log("INFO", ("Status: PaidTokens=%.2f | Listed=%d pets"):format(
+            getPaidTokens(),
+            (function()
+                local c = 0
+                for _ in pairs(_listedPets) do c = c + 1 end
+                return c
+            end)()
+        ))
+    end
+end
+
+function PlazaBot.Stop()
+    _running = false
+    log("INFO", "Stopped")
+end
+
+-- Register singleton instance (for bootstrap hot-reload)
+_ENVROOT.__PLAZA_BOT_INSTANCE = PlazaBot
+PlazaBot._running = true  -- Expose for bootstrap alive check
+
+----------------------------------------------------------------
+-- START
+----------------------------------------------------------------
+
+log("INFO", "=================================")
+log("INFO", "   PLAZA BOT v1.0")
+log("INFO", "=================================")
+
+-- Apply performance optimizations before heavy automation starts
+applyPerformanceOptimizations()
+
+PlazaBot.Run()
