@@ -13,7 +13,7 @@ local Config = {
     -- Performance Optimizations (reduce CPU/GPU/memory for 24/7 AFK)
     Performance = {
         Enabled = true,                -- Enable all optimizations
-        FPSCap = 10,                   -- Cap framerate (10-60; lower = less CPU)
+        FPSCap = 5,                   -- Cap framerate (10-60; lower = less CPU)
         Disable3DRendering = true,     -- Disable rendering (huge savings)
         DisableTextures = true,        -- Clear mesh textures
         DisableParticles = true,       -- Disable particles/trails/beams
@@ -85,6 +85,12 @@ local Config = {
         Blacklist = {
             "Serenity",
             "Frost Queen",
+            "SUPER Luckyblock",
+            "Dual Shock",
+            "Overcharged Robot",
+            "Fortunate Calico",
+            "Surge Dragon",
+            "JACKPOT",
         },
         
         -- Specific buy prices (max we'll pay for each pet)
@@ -136,11 +142,14 @@ local Config = {
             ["Frosty Snowman"] = 120,
 
             -- Electric pets
-            ["Dual Shock"] = 150,
-            ["Overcharged Robot"] = 600,
-            ["Surge Dragon"] = 80,
+            ["Dual Shock"] = 40,
+            ["Overcharged Robot"] = 200,
+            ["Surge Dragon"] = 20,
 
             ["2026 Balloons"] = 75
+            ["Jackpot"] = 260,
+            ["Fortunate Calico"] = 100,
+            ["SUPER Luckyblock"] = 15,
         },
         -- If no configured price: DO NOT AUTO-LIST (hold and send webhook)
         -- We removed DefaultMarkup - only sell at explicit prices!
